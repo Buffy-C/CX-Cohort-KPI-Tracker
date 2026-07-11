@@ -22,6 +22,11 @@ Charts produced:
 import argparse
 import subprocess
 import sys
+
+# Force UTF-8 output — see build_tracker.py for why this is needed on Windows.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 from pathlib import Path
 
 pkgs = ["pandas", "matplotlib", "openpyxl"]
@@ -68,25 +73,16 @@ TL_COLORS = [BLUE, TEAL, "#9B59B6", "#E67E22"]  # per team leader
 parser = argparse.ArgumentParser()
 parser.add_argument("--cohort", type=int, required=True,
                     help=f"Cohort number: {sorted(cfg.COHORTS)}")
-parser.add_argument("--wc", default=None,
-                    help="Weekly mode: week commencing, e.g. 2026-06-29")
-parser.add_argument("--month", type=int, default=None,
-                    help="Full-month mode: apply Month N targets, "
-                         "read Cohort_N/Month_N/")
+parser.add_argument("--wc", default=None, help="Weekly mode: W/C date")
+parser.add_argument("--month", type=int, default=None, help="Full-month mode")
 parser.add_argument("--data", default=None,
-                    help="Override folder containing the tracker xlsx")
+                    help="Override week folder containing the tracker xlsx")
 args = parser.parse_args()
 
 if bool(args.wc) == bool(args.month):
-    sys.exit("Pass exactly one of --wc (weekly report) or --month (full-month review).")
-
-# Provenance tag on every chart + filename so files stay identifiable
-# when handed from manager to manager.
+    sys.exit("Pass exactly one of --wc or --month.")
 if args.month:
     MONTH = args.month
-    if MONTH not in cfg.TARGETS_BY_MONTH:
-        sys.exit(f"No targets defined for Month {MONTH} "
-                 f"(defined: {sorted(cfg.TARGETS_BY_MONTH)})")
     T = cfg.TARGETS_BY_MONTH[MONTH]
     SUBTITLE_TAG = (f"{cfg.COHORTS[args.cohort]['name']} · Month {MONTH} "
                     f"(full month) · Programme Month {MONTH}")
@@ -109,7 +105,7 @@ FILE = matches[-1]
 OUT = week_dir / "charts"
 OUT.mkdir(exist_ok=True)
 
-print(f"Cohort {args.cohort}  |  {period_sub.replace('_', ' ')}  ->  Month {MONTH} targets")
+print(f"Cohort {args.cohort}  |  {period_sub.replace(chr(95), chr(32))}  ->  Month {MONTH} targets")
 print(f"Tracker: {FILE.name}")
 
 raw = pd.read_excel(FILE, sheet_name="Agent Tracker", header=2)
@@ -129,17 +125,49 @@ df = raw.rename(columns={
     "D56 %":            "D56",
     "D56 %\n(tracked)": "D56",
     "CSAT\nSurveys":    "Surveys",
+    "Prod\nHours":      "Prod_Hours",
+    "Closed":           "Closed_Cases",
+    "Complaints\nClosed": "Complaints_Closed",
 })
 
 for col in ["RPH", "FCR", "QA", "Compliance", "CSAT_score", "D1", "D28", "D56",
-            "Surveys", "QA_Evals", "Comp_Evals"]:
+            "Surveys", "QA_Evals", "Comp_Evals", "Prod_Hours", "Closed_Cases",
+            "Complaints_Closed"]:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# Normalise % metrics stored as 0-100 down to 0-1
-for col in ["FCR", "QA", "Compliance", "CSAT_score", "D1", "D28", "D56"]:
-    if col in df.columns and df[col].dropna().median() > 1:
+# Convert QA/Compliance from build_tracker.py's raw 0-100 scale to a 0-1
+# fraction. These two are ALWAYS raw 0-100 (see build_tracker.py's load_all():
+# "Compliance"/"QA Score" come straight from pd.to_numeric(...), never divided).
+# FCR/CSAT_score/D1/D28/D56 are ALWAYS already a 0-1 fraction by the time they
+# reach the Agent Tracker sheet (built via pct_to_float() / boolean .mean()).
+#
+# NOTE: this used to be guessed from each column's median (">1 means raw
+# 0-100"), which breaks whenever a majority of agents score exactly 0% —
+# median becomes 0, the /100 gets skipped, and a genuine 45.45% average
+# renders as "4545%" (and, via off-canvas text in kpi_bars, blows the chart
+# canvas out to thousands of pixels wide). Since we control both scripts,
+# hard-code the scale instead of inferring it.
+RAW_0_100_COLS = ["QA", "Compliance"]
+for col in RAW_0_100_COLS:
+    if col in df.columns:
         df[col] = df[col] / 100
+# FCR, CSAT_score, D1, D28, D56: no conversion needed — already 0-1 fractions.
+
+# Sanity-check: no percentage metric can realistically exceed 100%. A value
+# this far outside range means a source-data/export error (e.g. the Kishay
+# Davids AHT case) rather than a real score. Flag it and null it out instead
+# of letting one bad row wreck cohort averages and chart geometry (off-canvas
+# text stretching bbox_inches="tight" the same way the scale bug above did).
+PCT_COLS = ["FCR", "QA", "Compliance", "CSAT_score", "D1", "D28", "D56"]
+for col in PCT_COLS:
+    if col in df.columns:
+        bad = df[col] > 1.5   # >150% — not a plausible score
+        if bad.any():
+            for agent, val in df.loc[bad, ["Agent Name", col]].itertuples(index=False):
+                print(f"  ! {agent}: {col} = {val:.1%} looks like a data error "
+                      f"— excluded from charts, check the source export")
+            df.loc[bad, col] = np.nan
 
 # Targets as fractions where the data is a fraction
 TARGETS = {
@@ -166,6 +194,37 @@ ACTIVE = [k for k in ORDERED if TARGETS[k] is not None and k in df.columns]
 TRACKED_ONLY = [k for k in ORDERED if TARGETS[k] is None and k in df.columns
                 and df[k].notna().any()]
 M_KPI = len(ACTIVE)
+
+# Volume-weighted cohort averaging. A plain per-agent mean gives a 1-survey
+# agent the same pull on the cohort average as a 6-survey agent — this is
+# what caused the scorecard's CSAT tile (51.9%) to disagree with the
+# platform's own pooled team-level CSAT (62.1%, see build_tracker.py's
+# write_team_sheet). Weighting each agent's % by their underlying volume
+# (Surveys for CSAT, Evals for QA/Compliance) reproduces the pooled result
+# exactly — mathematically identical to summing raw counts and dividing.
+WEIGHT_COL = {
+    "CSAT_score": "Surveys",       # exact: Surveys is CSAT's own denominator
+    "QA":         "QA_Evals",      # exact
+    "Compliance": "Comp_Evals",    # exact
+    "RPH":        "Prod_Hours",    # exact: RPH = Closed Cases ÷ Prod Hours
+    "D1":         "Complaints_Closed",  # exact
+    "D28":        "Complaints_Closed",  # exact
+    "D56":        "Complaints_Closed",  # exact
+    "FCR":        "Closed_Cases",  # approximation — the platform doesn't
+                                    # export per-agent FCR success/fail counts,
+                                    # so Closed Cases is the closest available
+                                    # volume proxy, not an exact reconstruction
+}
+
+def weighted_mean(frame, k):
+    wcol = WEIGHT_COL.get(k)
+    if wcol and wcol in frame.columns:
+        sub = frame[[k, wcol]].dropna()
+        if len(sub) and sub[wcol].sum() > 0:
+            return (sub[k] * sub[wcol]).sum() / sub[wcol].sum()
+        return np.nan
+    series = frame[k].dropna()
+    return series.mean() if len(series) else np.nan
 
 def is_pct(k):
     return k != "RPH"
@@ -437,7 +496,7 @@ ax.text(NAME_W / 2, avg_y + CELL_H / 2, "Cohort average", ha="center", va="cente
         fontsize=8.2, fontweight="bold", color=INK, zorder=3)
 for mi, k in enumerate(HM_KPIS):
     x = NAME_W + mi * (CELL_W + PAD)
-    v = df_hm[k].mean()
+    v = weighted_mean(df_hm, k)
     bg_c, fg_c = cell_colour(v, k)
     if TARGETS[k] is not None and not pd.isna(v):
         d = v - TARGETS[k]
@@ -594,7 +653,7 @@ print(f"Saved -> kpi_pareto{FSUF}.png")
 stats = []
 for k in ACTIVE:
     series = df[k].dropna()
-    avg = series.mean() if len(series) else np.nan
+    avg = weighted_mean(df, k)
     t = TARGETS[k]
     if np.isnan(avg):
         status, colour = "NO DATA", GREY
@@ -670,7 +729,7 @@ if "Team Leader" in df.columns and df["Team Leader"].notna().any():
         sub = df[df["Team Leader"] == tl]
         tl_stats[tl] = {}
         for k in ACTIVE:
-            avg = sub[k].dropna().mean()
+            avg = weighted_mean(sub, k)
             tl_stats[tl][k] = dict(
                 avg=avg,
                 pct=(avg / TARGETS[k]) if not pd.isna(avg) else np.nan)

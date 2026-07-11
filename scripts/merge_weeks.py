@@ -13,17 +13,17 @@ Usage (run from the project root folder):
         -> merge exactly these week folders instead of auto-selecting
 
 How each file is merged (this matters — averaging averages is wrong):
-    Closed Complaints / CSAT responses  row-level: stacked, de-duplicated by
-                                        Case ID / Contact ID (latest week wins)
-    agent_productivity                  counts summed; RPH/CPH recomputed from
-                                        totals; FCR/CSAT weighted by contacts;
-                                        Open Cases = latest snapshot
-    agent_performance                   counts summed; handle times weighted
-                                        by volume
-    QA / Compliance scorecards          copied from the LATEST week — these
-                                        exports are accumulating scores, so
-                                        the newest file already covers the month
-    team-level single-value files       copied from the latest week
+    Closed Complaints / CSAT responses    row-level: stacked, de-duplicated by
+                                           Case ID / Contact ID (latest week wins)
+    agent_productivity                    counts summed; RPH/CPH recomputed from
+                                           totals; FCR/CSAT weighted by contacts;
+                                           Open Cases = latest snapshot
+    agent_performance                     counts summed; handle times weighted
+                                           by volume
+    QA / Compliance scorecards            copied from the LATEST week — these
+                                           exports are accumulating scores, so
+                                           the newest file already covers the month
+    team-level single-value files         copied from the latest week
 """
 
 import argparse
@@ -38,7 +38,6 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tracker_config as cfg
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -101,7 +100,6 @@ def read_weeks(week_dirs, fname):
         out.append((wc, df))
     return out
 
-
 # ── Args & week selection ─────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
@@ -153,11 +151,16 @@ if len(week_dirs) < 4:
 out_dir = cohort_dir / f"Month_{MONTH}" / "raw_data"
 out_dir.mkdir(parents=True, exist_ok=True)
 
-
 # ── 1. Row-level files: stack + de-duplicate ─────────────────────────────────
 
+# NOTE: the CSAT export changed from a single Resolution-Rating-only file
+# ("Number of Resolution Rating Responses.csv") to a blended export that
+# carries both an Agent Rating and a Resolution Rating category per survey
+# ("Blended_Customer_Satisfaction__.csv"). build_tracker.py now reads the
+# new file — merge_weeks.py needs to merge the same one, or a monthly
+# rollup would silently look for a file that no longer gets downloaded.
 for fname, key in [("Number of Closed Complaints.csv", "Case ID"),
-                   ("Number of Resolution Rating Responses.csv", "Contact ID")]:
+                   ("Blended_Customer_Satisfaction__.csv", "Contact ID")]:
     frames = read_weeks(week_dirs, fname)
     if not frames:
         print(f"  ! {fname}: no data in any week")
@@ -168,7 +171,6 @@ for fname, key in [("Number of Closed Complaints.csv", "Case ID"),
     merged.to_csv(out_dir / fname)
     print(f"  ✓ {fname}: {before} rows -> {len(merged)} unique {key}s")
 
-
 # ── 2. agent_productivity: totals + weighted rates ────────────────────────────
 
 frames = read_weeks(week_dirs, "agent_productivity.csv")
@@ -178,14 +180,14 @@ if frames:
               "Number of Contacts Disconnected", "Number of Closed Cases",
               "Number of Open Cases", "Resolves per Hour", "Contacts per Hour"]:
         allp[c] = pd.to_numeric(allp[c], errors="coerce")
-    allp["_fcr"]  = allp["First Contact Resolution %"].apply(pct_to_float)
+    allp["_fcr"] = allp["First Contact Resolution %"].apply(pct_to_float)
     allp["_csat"] = allp["CSAT Results - Blended Customer Satisfaction %"].apply(pct_to_float)
     allp["_resolves"] = allp["Resolves per Hour"] * allp["Productive Hours"]
 
     rows = []
     for agent, g in allp.groupby("Agent Name"):
         g = g.sort_values("_wc")
-        hours    = g["Productive Hours"].sum()
+        hours = g["Productive Hours"].sum()
         contacts = g["Number of Contacts Handled"].sum()
         rows.append({
             "Agent Name": agent,
@@ -203,13 +205,12 @@ if frames:
                 (f"{wavg(g['_fcr'], g['Number of Contacts Handled']):.1f}%"
                  if g["_fcr"].notna().any() else ""),
             "Number of Open Cases": g["Number of Open Cases"].dropna().iloc[-1]
-                if g["Number of Open Cases"].notna().any() else np.nan,   # snapshot
+                if g["Number of Open Cases"].notna().any() else np.nan,  # snapshot
             "QA Score": g["QA Score"].dropna().iloc[-1] if g["QA Score"].notna().any() else np.nan,
         })
     pd.DataFrame(rows).to_csv(out_dir / "agent_productivity.csv")
     print(f"  ✓ agent_productivity.csv: {len(rows)} agents "
           f"(counts summed, RPH/CPH from totals, FCR/CSAT contact-weighted)")
-
 
 # ── 3. agent_performance: totals + volume-weighted handle times ───────────────
 
@@ -231,7 +232,7 @@ if frames:
         g = g.sort_values("_wc")
         row = {"Agent Name": agent,
                "Team Leader": g["Team Leader"].dropna().iloc[-1]
-                   if g["Team Leader"].notna().any() else np.nan}
+                              if g["Team Leader"].notna().any() else np.nan}
         for c in COUNT_COLS:
             row[c] = g[c].sum()
         for c in TIME_COLS:
@@ -241,7 +242,6 @@ if frames:
     pd.DataFrame(rows).to_csv(out_dir / "agent_performance.csv")
     print(f"  ✓ agent_performance.csv: {len(rows)} agents "
           f"(counts summed, handle times volume-weighted)")
-
 
 # ── 4. QA / Compliance: latest week's file (accumulating scores) ─────────────
 
@@ -255,20 +255,20 @@ for fname in ["QA Dashboard-Quality Scores.csv",
     else:
         print(f"  ! {fname}: not found in latest week")
 
-
-# ── 5. Fallback + team-level files: latest week's copy ────────────────────────
-
-for fname in ["complaints_closed_by_agent.csv",
-              "blended_customer_satisfaction__.csv",
-              "agent_rating_customer_satisfaction__.csv",
-              "average_days_to_resolve_complaint.csv",
-              "average_complaint_age_of_open_complaints__calendar_days_.csv",
-              "complaint_closure_volumes.csv"]:
-    src = find_file(latest_dir, fname)
-    if src:
-        shutil.copy(src, out_dir / fname)
-        print(f"  ✓ {fname}: copied from latest week")
+# ── 5. Fallback file: latest week's copy ───────────────────────────────────────
+# The other former "team-level single-value" files (blended_customer_
+# satisfaction__.csv, agent_rating_customer_satisfaction__.csv,
+# average_days_to_resolve_complaint.csv, average_complaint_age_of_open_
+# complaints__calendar_days_.csv, complaint_closure_volumes.csv) were removed
+# here because build_tracker.py doesn't actually read them — they were dead
+# weight left over from an earlier export format. complaints_closed_by_agent.csv
+# is kept since build_tracker.py still uses it as a fallback when the closed-
+# complaints detail file is absent.
+src = find_file(latest_dir, "complaints_closed_by_agent.csv")
+if src:
+    shutil.copy(src, out_dir / "complaints_closed_by_agent.csv")
+    print(f"  ✓ complaints_closed_by_agent.csv: copied from latest week")
 
 print(f"\nDone -> {out_dir.resolve()}")
-print(f"Next:  python scripts/build_tracker.py --cohort {args.cohort} --month {MONTH}")
-print(f"       python scripts/dashboard.py     --cohort {args.cohort} --month {MONTH}")
+print(f"Next: python scripts/build_tracker.py --cohort {args.cohort} --month {MONTH}")
+print(f"      python scripts/dashboard.py     --cohort {args.cohort} --month {MONTH}")

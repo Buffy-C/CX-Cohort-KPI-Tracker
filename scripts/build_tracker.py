@@ -20,6 +20,16 @@ are handled automatically — no need to rename downloads.
 import argparse
 import re
 import sys
+
+# Force UTF-8 output. Windows' default console codepage (cp1252) can't
+# encode characters this script prints (≥, ✓, ✗, →, ·), which crashes with
+# a UnicodeEncodeError — this happens whether run directly in a plain
+# cmd.exe/PowerShell window or via a wrapper script that captures output.
+# reconfigure() is available on Python 3.7+; the getattr guard is just
+# defensive for any oddball stdout stream that doesn't support it.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 from pathlib import Path
 
 import pandas as pd
@@ -38,7 +48,7 @@ MONTH = None
 TAG = ""  # provenance: "Cohort 1 · W/C 22 Jun 2026 · Month 3 Targets"
 QA_PASS_RATE_THRESHOLD = cfg.QA_PASS_RATE_THRESHOLD
 
-# ── Brand colours ───────────────────────────────────────────────────
+# ── So Energy brand colours ───────────────────────────────────────────────────
 C_LIME    = "CBFB00"
 C_BLACK   = "131409"
 C_DARK    = "242C28"
@@ -90,7 +100,13 @@ def fmt_tgt(key):
 
 
 def parse_qa_agent(s):
-    """'Jane.Doe@example.com (Doe, Jane)' -> 'Jane Doe'"""
+    """'Shania.Solomons@so.energy (Solomons, Shania)' -> 'Shania Solomons'
+    Returns None for blank/missing values — the QA and Compliance exports
+    include a per-evaluation-form subtotal row with an empty Agent field,
+    and without this check that row gets stringified to the literal text
+    "nan" and treated as a phantom agent."""
+    if pd.isna(s) or str(s).strip() == "":
+        return None
     s = str(s)
     m = re.search(r'\(([^,]+),\s*([^)]+)\)', s)
     if m:
@@ -204,26 +220,43 @@ def load_all(data_dir: Path) -> dict:
     qa = pd.read_csv(ff("QA Dashboard-Quality Scores.csv"))
     qa.columns = qa.columns.str.strip()
     qa["Agent Name"] = qa["Agent"].apply(parse_qa_agent)
+    qa = qa[qa["Agent Name"].notna()].copy()   # drop per-form subtotal rows (blank Agent)
     qa["QA Score"]   = pd.to_numeric(qa["Avg. evaluation score"], errors="coerce")
     qa["QA Evals"]   = pd.to_numeric(qa["Evaluations performed"], errors="coerce")
     qa["QA Prior"]   = pd.to_numeric(qa["Prior avg. evaluation score"], errors="coerce")
     qa["QA Change"]  = qa["Percent change in avg. evaluation score"].apply(strip_pct_sign)
-    qa = qa.groupby("Agent Name", as_index=False).agg({
-        "QA Score": "mean", "QA Evals": "sum",
-        "QA Prior": "mean", "QA Change": "first"})
+
+    def _wavg(g, val_col, wt_col):
+        d = g[[val_col, wt_col]].dropna()
+        return (d[val_col] * d[wt_col]).sum() / d[wt_col].sum() if d[wt_col].sum() else np.nan
+
+    qa = qa.groupby("Agent Name").apply(lambda g: pd.Series({
+        # An agent can appear on more than one row if evaluated on more than
+        # one channel (e.g. Call + Email) in the same week. Weight by evals
+        # per row rather than taking a plain mean across rows, so an agent
+        # with 5 call evals and 1 email eval isn't blended 50/50.
+        "QA Score": _wavg(g, "QA Score", "QA Evals"),
+        "QA Evals": g["QA Evals"].sum(min_count=1),
+        "QA Prior": g["QA Prior"].mean(),
+        "QA Change": g["QA Change"].iloc[0],
+    }), include_groups=False).reset_index()
     results["qa"] = qa[["Agent Name","QA Score","QA Evals","QA Prior","QA Change"]]
 
     # 4. Compliance scores
     comp = pd.read_csv(ff("QA Dashboard-Compliance scorecard.csv"))
     comp.columns = comp.columns.str.strip()
     comp["Agent Name"] = comp["Agent"].apply(parse_qa_agent)
+    comp = comp[comp["Agent Name"].notna()].copy()   # drop per-form subtotal rows (blank Agent)
     comp["Compliance"] = pd.to_numeric(comp["Avg. evaluation score"], errors="coerce")
     comp["Comp Evals"] = pd.to_numeric(comp["Evaluations performed"], errors="coerce")
     comp["Comp Prior"] = pd.to_numeric(comp["Prior avg. evaluation score"], errors="coerce")
     comp["Comp Change"] = comp["Percent change in avg. evaluation score"].apply(strip_pct_sign)
-    comp = comp.groupby("Agent Name", as_index=False).agg({
-        "Compliance": "mean", "Comp Evals": "sum",
-        "Comp Prior": "mean", "Comp Change": "first"})
+    comp = comp.groupby("Agent Name").apply(lambda g: pd.Series({
+        "Compliance": _wavg(g, "Compliance", "Comp Evals"),
+        "Comp Evals": g["Comp Evals"].sum(min_count=1),
+        "Comp Prior": g["Comp Prior"].mean(),
+        "Comp Change": g["Comp Change"].iloc[0],
+    }), include_groups=False).reset_index()
     results["comp"] = comp[["Agent Name","Compliance","Comp Evals","Comp Prior","Comp Change"]]
 
     # 5. Complaints closed by agent (fallback summary)
@@ -235,18 +268,44 @@ def load_all(data_dir: Path) -> dict:
     except Exception:
         results["cc"] = pd.DataFrame(columns=["Agent Name","Complaints Closed"])
 
-    # 6. CSAT
+    # 6. CSAT — blended (average of Agent Rating % Positive and Resolution Rating % Positive)
     try:
-        csat_raw = pd.read_csv(ff("Number of Resolution Rating Responses.csv"), index_col=0)
+        csat_raw = pd.read_csv(ff("Blended_Customer_Satisfaction__.csv"), index_col=0)
         csat_raw.columns = csat_raw.columns.str.strip()
-        csat_raw["Positive"] = csat_raw["CSAT Resolution Rating Category"].str.strip() == "Positive"
+        csat_raw["Positive_Agent"]      = csat_raw["CSAT Agent Rating Category"].str.strip() == "Positive"
+        csat_raw["Positive_Resolution"] = csat_raw["CSAT Resolution Rating Category"].str.strip() == "Positive"
         csat_agg = csat_raw.groupby("Agent Name").agg(
             Surveys=("Contact ID","count"),
-            Positive=("Positive","sum")).reset_index()
-        csat_agg["CSAT"] = csat_agg["Positive"] / csat_agg["Surveys"]
-        results["csat_agent"] = csat_agg[["Agent Name","CSAT","Surveys"]]
+            Positive_Agent=("Positive_Agent","sum"),
+            Positive_Resolution=("Positive_Resolution","sum")).reset_index()
+        csat_agg["CSAT_Agent_Rating"]      = csat_agg["Positive_Agent"] / csat_agg["Surveys"]
+        csat_agg["CSAT_Resolution_Rating"] = csat_agg["Positive_Resolution"] / csat_agg["Surveys"]
+        # Blended CSAT = simple average of the two % Positive streams (matches team-level
+        # "blended_customer_satisfaction__.csv" export methodology)
+        csat_agg["CSAT"] = (csat_agg["CSAT_Agent_Rating"] + csat_agg["CSAT_Resolution_Rating"]) / 2
+        results["csat_agent"] = csat_agg[
+            ["Agent Name","CSAT","CSAT_Agent_Rating","CSAT_Resolution_Rating","Surveys"]]
+
+        # Pooled (volume-weighted) team-level blend — sums raw counts across ALL
+        # surveys before dividing, rather than averaging the per-agent CSAT %s.
+        # This is what reconciles to the platform's own team-level CSAT figure;
+        # a plain mean of agent CSATs understates the score whenever agents have
+        # uneven survey volumes (small-n agents get the same weight as big-n ones).
+        total_surveys = int(csat_raw["Contact ID"].count())
+        if total_surveys:
+            pct_agent      = csat_raw["Positive_Agent"].sum() / total_surveys
+            pct_resolution = csat_raw["Positive_Resolution"].sum() / total_surveys
+            results["csat_team"] = {
+                "Surveys": total_surveys,
+                "CSAT_Agent_Rating": pct_agent,
+                "CSAT_Resolution_Rating": pct_resolution,
+                "CSAT": (pct_agent + pct_resolution) / 2,
+            }
+        else:
+            results["csat_team"] = None
     except Exception:
         results["csat_agent"] = None
+        results["csat_team"] = None
 
     # 7. D1 / D28 / D56 from closed complaints
     try:
@@ -278,9 +337,28 @@ def load_all(data_dir: Path) -> dict:
             D28=("D28_bool", "mean"),
             D56=("D56_bool", "mean")).reset_index()
         results["d1_agent"] = d_agg
+
+        # Team-level pooled D1/D28/D56, computed from EVERY closed complaint
+        # attributed to the team — not restricted to agents who happen to
+        # appear in this week's agent_productivity.csv. An agent can close a
+        # complaint in a week they weren't on live queues (leave, ad-hoc
+        # complaint work, etc.), and restricting to the productivity roster
+        # silently drops those complaints from the team total, understating
+        # the pooled rate. This mirrors the CSAT_team pooling above.
+        total_closed = int(comp_raw["Case ID"].count())
+        if total_closed:
+            results["complaints_team"] = {
+                "Complaints Closed": total_closed,
+                "D1":  comp_raw["D1_bool"].sum()  / total_closed,
+                "D28": comp_raw["D28_bool"].sum() / total_closed,
+                "D56": comp_raw["D56_bool"].sum() / total_closed,
+            }
+        else:
+            results["complaints_team"] = None
     except Exception as e:
         print("Warning: D1/D28/D56 load failed:", e)
         results["d1_agent"] = None
+        results["complaints_team"] = None
 
     # 8. Team-level stats
     def read_single(fname):
@@ -299,8 +377,8 @@ def load_all(data_dir: Path) -> dict:
 
     perf = results["perf"]
     results["team"] = {
-        "CSAT Blended %":       read_single("blended_customer_satisfaction__.csv"),
-        "CSAT Agent Rating %":  read_single("agent_rating_customer_satisfaction__.csv"),
+        "CSAT_Pooled":           results.get("csat_team"),
+        "Complaints_Pooled":     results.get("complaints_team"),
         "Avg Handle Time":      mean_time(perf.get("AHT_min", pd.Series())),
         "Avg ACW Time":         mean_time(perf.get("ACW_min", pd.Series())),
         "Avg Hold Time":        mean_time(perf.get("Hold_min", pd.Series())),
@@ -370,7 +448,7 @@ def write_control_sheet(wb, data_dir: Path):
     ws = wb.create_sheet("Control", 0)
     ws.sheet_view.showGridLines = False
 
-    ws.merge_cells("A1:F1")
+    ws.merge_cells("A1:G1")
     style_cell(ws.cell(row=1, column=1,
                value=f"KPI Tracker — Data Sources & Control  |  {TAG}"),
                fill=FILL_HEADER,
@@ -378,19 +456,20 @@ def write_control_sheet(wb, data_dir: Path):
                align=ALIGN_C)
     ws.row_dimensions[1].height = 36
 
-    ws.merge_cells("A2:F2")
+    ws.merge_cells("A2:G2")
     style_cell(ws.cell(row=2, column=1,
-               value="Required: agent_productivity.csv  |  agent_performance.csv  |  Number of Closed Complaints.csv  |  Number of Resolution Rating Responses.csv  |  QA Dashboard-Quality Scores.csv  |  QA Dashboard-Compliance scorecard.csv     Optional: blended_customer_satisfaction__.csv  |  agent_rating_customer_satisfaction__.csv  |  average_days_to_resolve_complaint.csv  |  average_complaint_age_of_open_complaints__calendar_days_.csv  |  complaint_closure_volumes.csv     Run: python scripts/build_tracker.py --cohort N --wc YYYY-MM-DD"),
+               value="Required: agent_productivity.csv  |  agent_performance.csv  |  Number of Closed Complaints.csv  |  Blended_Customer_Satisfaction__.csv  |  QA Dashboard-Quality Scores.csv  |  QA Dashboard-Compliance scorecard.csv     Run: python scripts/build_tracker.py --cohort N --wc YYYY-MM-DD"),
                fill=FILL_GREY_BG,
                font=Font(name="Arial", italic=True, color=C_GREY, size=9),
                align=ALIGN_L)
     ws.row_dimensions[2].height = 18
 
-    widths = [32, 36, 18, 14, 22, 34]
+    widths = [30, 32, 46, 12, 12, 20, 26]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
-    headers = ["Filename", "Source / Report Name", "Required?", "Present?", "Populates", "Notes"]
+    headers = ["Filename", "Source / Report Name", "How It's Calculated",
+                "Required?", "Present?", "Populates", "Notes"]
     ws.row_dimensions[3].height = 24
     for c, h in enumerate(headers, 1):
         style_cell(ws.cell(row=3, column=c, value=h),
@@ -398,57 +477,59 @@ def write_control_sheet(wb, data_dir: Path):
 
     FILES = [
         ("agent_productivity.csv",
-         "Agent Productivity report", True,
+         "Agent Productivity report",
+         "RPH, FCR %, contact/case counts and Productive Hours are taken directly "
+         "from the platform export as-is — no calculation is applied, other than "
+         "parsing the FCR % text into a decimal.",
+         True,
          "Agent Tracker — core",
          "RPH, FCR, contacts, hours, open/closed cases"),
         ("agent_performance.csv",
-         "Agent Performance report", True,
+         "Agent Performance report",
+         "AHT, ACW, Hold and ASA are exported as HH:MM:SS text and converted to "
+         "decimal minutes (hours×60 + minutes + seconds÷60). Call/email volumes "
+         "are taken directly from the export.",
+         True,
          "Agent Tracker — handle times",
          "AHT, ACW, hold time, ASA, call/email volumes"),
         ("QA Dashboard-Quality Scores.csv",
-         "QA Dashboard → Quality Scores", True,
+         "QA Dashboard → Quality Scores",
+         "QA Score = mean of 'Avg. evaluation score' across all rows for that "
+         "agent (averaged if multiple evaluations/periods are present). "
+         "QA Evals = sum of 'Evaluations performed'.",
+         True,
          "QA & Compliance tab + Agent Tracker",
          f"Accumulating scores — target {fmt_tgt('QA Score')} "
          f"({TARGETS['QA Autofails']} autofail max)"),
         ("QA Dashboard-Compliance scorecard.csv",
-         "QA Dashboard → Compliance Scorecard", True,
+         "QA Dashboard → Compliance Scorecard",
+         "Compliance = mean of 'Avg. evaluation score' across all rows for that "
+         "agent. Comp Evals = sum of 'Evaluations performed'. Same logic as "
+         "QA Score, applied to the compliance scorecard export.",
+         True,
          "QA & Compliance tab + Agent Tracker",
          f"Accumulating scores — target {fmt_tgt('Compliance')}"),
         ("Number of Closed Complaints.csv",
-         "AWS Complaints → Closed Complaints (detail)", True,
+         "AWS Complaints → Closed Complaints (detail)",
+         "D1/D28/D56 = % of that agent's closed complaints marked 'Yes' for "
+         "Resolved within 1/28/56 days (mean of the Yes/No flag per agent). "
+         "Complaints Closed = count of Case IDs per agent.",
+         True,
          "Agent Tracker — D1 %, D28 %, D56 %",
          f"D1 target {fmt_tgt('D1')} | D28 {fmt_tgt('D28')} | D56 {fmt_tgt('D56')}"),
-        ("Number of Resolution Rating Responses.csv",
-         "CSAT → Resolution Rating Responses (detail)", True,
+        ("Blended_Customer_Satisfaction__.csv",
+         "CSAT → Blended Customer Satisfaction (detail)",
+         "Blended CSAT = average of two % Positive rates per agent: "
+         "(Positive Agent Ratings ÷ Surveys) and (Positive Resolution Ratings ÷ "
+         "Surveys), then (%Agent + %Resolution) ÷ 2. Surveys = count of Contact IDs.",
+         True,
          "Agent Tracker — CSAT %, Surveys",
-         f"Per-agent CSAT % and survey count — target {fmt_tgt('CSAT')}"),
-        ("complaints_closed_by_agent.csv",
-         "AWS Complaints → Closed by Agent (summary)", False,
-         "Agent Tracker — Complaints Closed (fallback)",
-         "Used only if closed complaints detail file is absent"),
-        ("blended_customer_satisfaction__.csv",
-         "CSAT Overview → Blended %", False,
-         "Team Overview — operational metrics",
-         "Team-level blended CSAT %"),
-        ("agent_rating_customer_satisfaction__.csv",
-         "CSAT Overview → Agent Rating %", False,
-         "Team Overview — operational metrics",
-         "Team-level agent rating CSAT %"),
-        ("average_days_to_resolve_complaint.csv",
-         "AWS Complaints → Avg Days to Resolve", False,
-         "Team Overview — operational metrics",
-         "Team average complaint resolution time in days"),
-        ("average_complaint_age_of_open_complaints__calendar_days_.csv",
-         "AWS Complaints → Avg Open Complaint Age", False,
-         "Team Overview — operational metrics",
-         "Average age of currently open complaints (days)"),
-        ("complaint_closure_volumes.csv",
-         "AWS Complaints → Closure Volumes (weekly)", False,
-         "Team Overview — operational metrics",
-         "Total complaints closed in the week"),
+         f"Per-agent CSAT % and survey count — target {fmt_tgt('CSAT')}. "
+         f"Download may append a number, e.g. '(2)', if re-exported — this is "
+         f"matched automatically."),
     ]
 
-    for ri, (fname, source, required, populates, notes) in enumerate(FILES):
+    for ri, (fname, source, calc, required, populates, notes) in enumerate(FILES):
         r = 4 + ri
         ws.row_dimensions[r].height = 20
         try:
@@ -463,14 +544,14 @@ def write_control_sheet(wb, data_dir: Path):
         pres_label = "✓ Found"   if present    else "✗ Missing"
         pres_fill  = FILL_TEAL   if present    else (FILL_RED if required else FILL_AMBER)
 
-        row_vals = [fname, source, req_label, pres_label, populates, notes]
+        row_vals = [fname, source, calc, req_label, pres_label, populates, notes]
         for c, val in enumerate(row_vals, 1):
             cell = ws.cell(row=r, column=c, value=val)
-            if c == 3:
+            if c == 4:
                 style_cell(cell, fill=req_fill,
                            font=Font(name="Arial", bold=True, color=C_BLACK, size=9),
                            align=ALIGN_C, border=BORDER_THIN)
-            elif c == 4:
+            elif c == 5:
                 style_cell(cell, fill=pres_fill,
                            font=Font(name="Arial", bold=True, color=C_BLACK, size=9),
                            align=ALIGN_C, border=BORDER_THIN)
@@ -480,7 +561,7 @@ def write_control_sheet(wb, data_dir: Path):
                            align=ALIGN_L, border=BORDER_THIN)
 
     tgt_row = 4 + len(FILES) + 1
-    ws.merge_cells(f"A{tgt_row}:F{tgt_row}")
+    ws.merge_cells(f"A{tgt_row}:G{tgt_row}")
     style_cell(ws.cell(row=tgt_row, column=1, value=cfg.targets_summary(MONTH)),
                fill=FILL_LIME,
                font=Font(name="Arial", bold=True, color=C_BLACK, size=9),
@@ -488,7 +569,7 @@ def write_control_sheet(wb, data_dir: Path):
     ws.row_dimensions[tgt_row].height = 18
 
     leg_row = tgt_row + 1
-    ws.merge_cells(f"A{leg_row}:F{leg_row}")
+    ws.merge_cells(f"A{leg_row}:G{leg_row}")
     style_cell(ws.cell(row=leg_row, column=1,
                value="Legend:   ✓ Found = file detected in your data folder at time of build   |   ✗ Missing = file not found (required files will cause errors; optional files are skipped gracefully)"),
                fill=FILL_GREY_BG,
@@ -540,7 +621,7 @@ def write_agent_sheet(wb, df):
 
     SECTIONS = [
         (1,  2,  "IDENTITY",          FILL_HEADER,  FONT_HDR),
-        (3,  8,  "STC CORE KPIs",     FILL_LIME,    FONT_LIME),
+        (3,  8,  "CORE KPIs",     FILL_LIME,    FONT_LIME),
         (9,  18, "VOLUME & ACTIVITY", FILL_SUBHDR,  FONT_SUBHDR),
         (19, 22, "HANDLE TIMES",      FILL_SUBHDR,  FONT_SUBHDR),
         (23, 23, "COMPLAINTS",        FILL_SUBHDR,  FONT_SUBHDR),
@@ -627,13 +708,13 @@ def write_team_sheet(wb, df, team_stats):
     ws.sheet_view.showGridLines = False
 
     ws.merge_cells("A1:H1")
-    t = ws.cell(row=1, column=1, value=f"Team STC Overview  |  {TAG}")
+    t = ws.cell(row=1, column=1, value=f"Team Overview  |  {TAG}")
     style_cell(t, fill=FILL_HEADER,
                font=Font(name="Arial", bold=True, color=C_LIME, size=14), align=ALIGN_C)
     ws.row_dimensions[1].height = 36
 
     ws.merge_cells("A2:H2")
-    style_cell(ws.cell(row=2, column=1, value="STC CORE KPIs — Cohort Summary"),
+    style_cell(ws.cell(row=2, column=1, value="CORE KPIs — Cohort Summary"),
                fill=FILL_SUBHDR, font=FONT_SUBHDR, align=ALIGN_C)
     ws.row_dimensions[2].height = 20
 
@@ -674,10 +755,76 @@ def write_team_sheet(wb, df, team_stats):
          f"Target: {fmt_tgt('D56')}  (resolved within 56 days)"),
     ]
 
+    # Exact-reconstruction weights: col -> volume column. Because each of
+    # these per-agent %s is itself Numerator ÷ Volume, weighting the mean by
+    # Volume reproduces the true pooled team rate exactly (sum(Numerator) ÷
+    # sum(Volume)) rather than a plain per-agent average, which silently
+    # gives a 1-response agent the same pull as a high-volume agent.
+    EXACT_WEIGHT_COL = {
+        "RPH": "Prod Hours",
+        "D1":  "Complaints Closed",
+        "D28": "Complaints Closed",
+        "D56": "Complaints Closed",
+        "QA Score":   "QA Evals",
+        "Compliance": "Comp Evals",
+    }
+    # FCR has no raw success/fail counts available per agent — only the
+    # platform's own pre-computed % — so this is a best-effort approximation
+    # (weighted by Closed Cases) rather than an exact pooled reconstruction.
+    APPROX_WEIGHT_COL = {"FCR": "Closed Cases"}
+
+    def _pooled_avg(frame, col, wcol):
+        d = frame[[col, wcol]].dropna()
+        return (d[col] * d[wcol]).sum() / d[wcol].sum() if len(d) and d[wcol].sum() else np.nan
+
     for r_offset, (col, label, target, fmt_fn, note) in enumerate(kpi_rows, 4):
         ws.row_dimensions[r_offset].height = 20
         series = tp_df[col].dropna() if col in tp_df.columns else pd.Series([], dtype=float)
         avg = series.mean() if len(series) else np.nan
+
+        if col in EXACT_WEIGHT_COL and EXACT_WEIGHT_COL[col] in tp_df.columns:
+            pooled_avg = _pooled_avg(tp_df, col, EXACT_WEIGHT_COL[col])
+            if not np.isnan(pooled_avg):
+                avg = pooled_avg
+                note = f"{note}  |  Pooled by {EXACT_WEIGHT_COL[col]} (not a plain agent average)"
+        elif col in APPROX_WEIGHT_COL and APPROX_WEIGHT_COL[col] in tp_df.columns:
+            pooled_avg = _pooled_avg(tp_df, col, APPROX_WEIGHT_COL[col])
+            if not np.isnan(pooled_avg):
+                avg = pooled_avg
+                note = (f"{note}  |  Weighted by {APPROX_WEIGHT_COL[col]} — approximation, "
+                        f"exact per-agent FCR denominator isn't exported")
+
+        if col == "CSAT":
+            # Cohort Avg for CSAT is pooled across all surveys (sum of Positive
+            # counts ÷ sum of Surveys) so it reconciles to the platform's own
+            # team-level blended CSAT figure. A plain mean of agent CSAT %s
+            # under-weights agents with more survey responses and can
+            # materially understate the true team score.
+            pooled = team_stats.get("CSAT_Pooled")
+            if pooled:
+                avg = pooled["CSAT"]
+                note = (f"{note}  |  Pooled across {pooled['Surveys']} surveys "
+                        f"(Agent Rating {pooled['CSAT_Agent_Rating']:.1%}, "
+                        f"Resolution Rating {pooled['CSAT_Resolution_Rating']:.1%})")
+
+        if col in ("D1", "D28", "D56"):
+            # Prefer the full-team pool (every complaint closed under this
+            # team this week) over the roster-restricted pool above. An
+            # agent can close a complaint in a week they weren't on live
+            # queues at all (leave, ad-hoc complaint handling), so
+            # restricting to this week's productivity roster silently drops
+            # some of the team's own complaints from the total. This gets
+            # closer to — but is not guaranteed to exactly match — the
+            # platform's own figure; a residual gap can remain if the
+            # platform's D1/D28/D56 widgets apply a filter (e.g. an
+            # "Is Autologged" toggle) that isn't present in this export.
+            pooled_c = team_stats.get("Complaints_Pooled")
+            if pooled_c and col in pooled_c:
+                avg = pooled_c[col]
+                note = (f"{note}  |  Pooled across all {pooled_c['Complaints Closed']} "
+                        f"complaints closed under this team (not restricted to this "
+                        f"week's productivity roster) — may still differ slightly from "
+                        f"the platform if it applies filters not present in this export")
 
         if target is None:
             status = "TRACKED"
@@ -726,8 +873,6 @@ def write_team_sheet(wb, df, team_stats):
                    fill=FILL_DARK, font=FONT_SUBHDR, align=ALIGN_C, border=BORDER_THIN)
 
     op_items = [
-        ("CSAT Blended %",           team_stats.get("CSAT Blended %","—"),       "blended_customer_satisfaction__.csv"),
-        ("CSAT Agent Rating %",      team_stats.get("CSAT Agent Rating %","—"),  "agent_rating_customer_satisfaction__.csv"),
         ("Avg Handle Time",          team_stats.get("Avg Handle Time","—"),       "agent_performance.csv"),
         ("Avg ACW Time",             team_stats.get("Avg ACW Time","—"),          "agent_performance.csv"),
         ("Avg Hold Time",            team_stats.get("Avg Hold Time","—"),         "agent_performance.csv"),
@@ -863,45 +1008,36 @@ def main():
     parser = argparse.ArgumentParser(description="Build KPI tracker from CSV exports")
     parser.add_argument("--cohort", type=int, required=True,
                         help=f"Cohort number: {sorted(cfg.COHORTS)}")
-    parser.add_argument("--wc", default=None,
-                        help="Weekly mode: week commencing date, e.g. 2026-06-29")
-    parser.add_argument("--month", type=int, default=None,
-                        help="Full-month mode: apply Month N targets, "
-                             "read Cohort_N/Month_N/raw_data")
+    parser.add_argument("--wc", default=None, help="Weekly mode: W/C date")
+    parser.add_argument("--month", type=int, default=None, help="Full-month mode")
     parser.add_argument("--data", default=None,
-                        help="Override raw CSV folder")
+                        help="Override raw CSV folder (default: Cohort_N/WC_date/raw_data)")
     parser.add_argument("--out", default=None, help="Override output filename")
     args = parser.parse_args()
 
     if bool(args.wc) == bool(args.month):
-        sys.exit("Pass exactly one of --wc (weekly report) or --month (full-month review).")
-
+        sys.exit("Pass exactly one of --wc or --month.")
     cohort_name = cfg.COHORTS[args.cohort]["name"]
     root = Path(__file__).resolve().parent.parent
-
     if args.month:
         MONTH = args.month
-        if MONTH not in cfg.TARGETS_BY_MONTH:
-            sys.exit(f"No targets defined for Month {MONTH} "
-                     f"(defined: {sorted(cfg.TARGETS_BY_MONTH)})")
         TARGETS = cfg.TARGETS_BY_MONTH[MONTH]
-        period_dir  = root / f"Cohort_{args.cohort}" / f"Month_{MONTH}"
-        stamp       = f"C{args.cohort}_Month_{MONTH}"
-        TAG         = f"{cohort_name} · Month {MONTH} (full month) · Month {MONTH} Targets"
+        week_dir = root / f"Cohort_{args.cohort}" / f"Month_{MONTH}"
+        stamp = f"C{args.cohort}_Month_{MONTH}"
+        TAG = f"{cohort_name} · Month {MONTH} (full month) · Month {MONTH} Targets"
         period_desc = f"Month {MONTH} (full month)"
     else:
         MONTH, TARGETS = cfg.get_targets(args.cohort, args.wc)
-        period_dir  = root / f"Cohort_{args.cohort}" / f"WC_{args.wc}"
-        stamp       = f"C{args.cohort}_WC_{args.wc}"
-        TAG         = f"{cfg.week_label(args.cohort, args.wc)} · Month {MONTH} Targets"
+        week_dir = root / f"Cohort_{args.cohort}" / f"WC_{args.wc}"
+        stamp = f"C{args.cohort}_WC_{args.wc}"
+        TAG = f"{cfg.week_label(args.cohort, args.wc)} · Month {MONTH} Targets"
         period_desc = f"W/C {args.wc}"
-
-    data_dir = Path(args.data) if args.data else period_dir / "raw_data"
+    data_dir = Path(args.data) if args.data else week_dir / "raw_data"
     if not data_dir.exists():
         sys.exit(f"Raw data folder not found: {data_dir}\n"
-                 f"Create it and drop the period's CSV exports inside, then re-run.")
+                 f"Create it and drop this week's CSV exports inside, then re-run.")
 
-    out = Path(args.out) if args.out else period_dir / f"KPI_Tracker_{stamp}.xlsx"
+    out = Path(args.out) if args.out else week_dir / f"KPI_Tracker_{stamp}.xlsx"
 
     print(f"Cohort:  {cohort_name} (started {cfg.COHORTS[args.cohort]['start']})")
     print(f"Period:  {period_desc}  ->  Month {MONTH} targets")
